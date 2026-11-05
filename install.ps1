@@ -19,7 +19,7 @@ if (-not $cfPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administ
     exit 1
 }
 
-$Repo = "huilang-me/cfsm-agent"
+$Repo = "Mattease/cfsm-agent"
 $GitHubProxy = ""
 $InstallVersion = "latest"
 
