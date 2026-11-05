@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${{ github.event.release.tag_name || github.ref_name }}"
           if [ -z "$VERSION" ]; then
             VERSION="${{ github.sha }}"
           fi
