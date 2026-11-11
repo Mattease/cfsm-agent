@@ -195,8 +195,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # 版本号必须来自 snapshot job 的 output：镜像 tag、release tag 和二进制
+          # 内嵌版本共用同一个字符串，docker job 里不再取一次时间，避免跨分钟漂移。
           if [ -z "${VERSION}" ]; then
-            VERSION="Snapshot-${GITHUB_SHA::7}"
+            echo "missing snapshot version output; refusing to build an image whose tag cannot match the release" >&2
+            exit 1
           fi
           LDFLAGS="-s -w -X main.version=${VERSION}"
           echo "Docker binary version: ${VERSION}"
@@ -223,8 +226,10 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=snapshot
+            type=raw,value=${{ needs.snapshot.outputs.version }}
 
       - name: Build and push Docker image
+        id: build-push
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -234,3 +239,94 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           no-cache: true
           provenance: false
+
+      # 快照镜像只保留最新一份，并连带清理它的平台子 manifest，做到“推一次净增 0”。
+      #
+      # 删除对象必须同时满足：
+      #   1. 该 version 只有一个 tag，且形如 Snapshot-<10位时间戳>；
+      #   2. digest 不是本次刚推送的那个（当前镜像同时带 snapshot 标签，天然不匹配）。
+      # 因此 latest / v* / sha-* / 手动标签 / 浮动 tag snapshot 都不会被删除。
+      #
+      # 顺序固定为「取子 digest -> 删索引 -> 删子 manifest」：先删子 manifest 会让仍被
+      # tag 指向的索引短暂损坏。子 manifest 自身带 tag、或等于刚推送的 digest 时跳过。
+      - name: Prune older snapshot images
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSHED_DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PUSHED_DIGEST}" ]; then
+            echo "missing pushed image digest, skip pruning to avoid deleting the live snapshot" >&2
+            exit 0
+          fi
+          owner="${GITHUB_REPOSITORY%%/*}"
+          pkg="$(printf '%s' "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')"
+          image="${REGISTRY}/${IMAGE_NAME}"
+
+          # 一次取全量版本：id、逗号分隔的 tags、digest。多 tag 的 version 其 tags 字段
+          # 会带逗号，下面的“单 tag”正则因此天然把它排除。
+          base=""
+          versions=""
+          for scope in users orgs; do
+            if out="$(gh api --paginate "/${scope}/${owner}/packages/container/${pkg}/versions?per_page=100" \
+                 --jq '.[] | [.id, ((.metadata.container.tags // []) | join(",")), .name] | @tsv' 2>/dev/null)"; then
+              base="/${scope}/${owner}/packages/container/${pkg}"
+              versions="$out"
+              break
+            fi
+          done
+          if [ -z "$base" ]; then
+            echo "container package ${pkg} not found under ${owner}, skip pruning" >&2
+            exit 0
+          fi
+
+          pruned=0
+          while IFS="$(printf '\t')" read -r id tags digest; do
+            if [ -z "$id" ]; then
+              continue
+            fi
+            if [ "$digest" = "${PUSHED_DIGEST}" ]; then
+              echo "keep ${digest} (just pushed)"
+              continue
+            fi
+            if [[ ! "$tags" =~ ^Snapshot-[0-9]{10}$ ]]; then
+              continue
+            fi
+
+            # 先取子 digest，再删索引；取不到时只删索引，残留的子 manifest 交给人工脚本兜底。
+            children=""
+            if raw="$(docker buildx imagetools inspect --raw "${image}@${digest}" 2>/dev/null)"; then
+              children="$(printf '%s' "$raw" | jq -r '.manifests[]?.digest' 2>/dev/null || true)"
+            else
+              echo "warn: cannot read manifest of ${digest}, its child manifests may stay behind" >&2
+            fi
+
+            echo "pruning snapshot index ${id} (${digest})"
+            if ! gh api -X DELETE "${base}/versions/${id}"; then
+              echo "failed to delete index ${id}" >&2
+              continue
+            fi
+            pruned=$((pruned + 1))
+
+            for child in $children; do
+              if [ "$child" = "${PUSHED_DIGEST}" ]; then
+                continue
+              fi
+              row="$(printf '%s\n' "$versions" | awk -F'\t' -v d="$child" '$3==d {print $1"\t"$2; exit}')"
+              if [ -z "$row" ]; then
+                echo "warn: child ${child} not listed, skip" >&2
+                continue
+              fi
+              child_id="$(printf '%s' "$row" | cut -f1)"
+              child_tags="$(printf '%s' "$row" | cut -f2)"
+              if [ -n "$child_tags" ]; then
+                echo "keep child ${child_id} (tagged: ${child_tags})"
+                continue
+              fi
+              echo "pruning child manifest ${child_id} (${child})"
+              gh api -X DELETE "${base}/versions/${child_id}" || echo "failed to delete child ${child_id}" >&2
+            done
+          done <<< "$versions"
+
+          echo "pruned ${pruned} snapshot index(es)"

@@ -114,7 +114,7 @@ curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.
 
 普通用户安装时，自动更新会在 `~/.cf-probe/` 内下载并替换当前用户的二进制，随后退出当前进程，由 `systemd --user` 或 macOS LaunchAgent 按服务重启策略拉起新版本；不会触碰 root 路径或系统级服务。
 
-更新检查（`api.github.com`）、新二进制下载（`github.com`）、指标上报以及公网 IP 查询的 DNS 解析默认使用系统原生 DNS；仅在配置了 `--install-ghproxy`（通常为系统 DNS 被污染的国内服务器）或通过环境变量 `CF_PROBE_UPDATE_DNS` 显式指定 DNS 服务器时，才启用 Agent 内置的公共 DNS 轮询解析（阿里、DNSPod、114、Cloudflare、Google，UDP 53），此时不依赖系统 DNS，内置 DNS 全部不可用时回退系统 DNS。`CF_PROBE_UPDATE_DNS` 会自动补全 `:53` 端口（如 `CF_PROBE_UPDATE_DNS=223.5.5.5`）。root/system 模式更新时 Agent 会把新二进制下载到配置目录，再调度新二进制执行自身的 `install` 完成替换并重启服务；普通用户模式按上一段直接自替换。两种模式都不经过 install.sh 和 curl；下载或调度失败时旧版本不受影响，下次检查自动重试。如 `github.com` 完全不可达，可配置 `--install-ghproxy` 代理（仅用于二进制文件下载；`api.github.com` 的版本检查始终直连，gh-proxy 类服务不支持 API 转发）。
+更新检查（`api.github.com`）、新二进制下载（`github.com`）和指标上报的 DNS 解析默认使用系统原生 DNS；仅在配置了 `--install-ghproxy`（通常为系统 DNS 被污染的国内服务器）或通过环境变量 `CF_PROBE_UPDATE_DNS` 显式指定 DNS 服务器时，才启用 Agent 内置的公共 DNS 轮询解析（阿里、DNSPod、114、Cloudflare、Google，UDP 53），此时不依赖系统 DNS，内置 DNS 全部不可用时回退系统 DNS。公网 IP 查询是例外：始终走系统 DNS 并直连，不使用代理环境变量，也不使用内置公共 DNS（走代理会取到代理出口地址而非本机公网 IP）。`CF_PROBE_UPDATE_DNS` 会自动补全 `:53` 端口（如 `CF_PROBE_UPDATE_DNS=223.5.5.5`）。root/system 模式更新时 Agent 会把新二进制下载到配置目录，再调度新二进制执行自身的 `install` 完成替换并重启服务；普通用户模式按上一段直接自替换。两种模式都不经过 install.sh 和 curl；下载或调度失败时旧版本不受影响，下次检查自动重试。如 `github.com` 完全不可达，可配置 `--install-ghproxy` 代理（仅用于二进制文件下载；`api.github.com` 的版本检查始终直连，gh-proxy 类服务不支持 API 转发）。
 
 ## 支持的架构
 
@@ -419,8 +419,8 @@ Agent 只使用 Worker 成功 HTTP 响应里的 `Date` 头做时间校准，包�
 | `processes` | string | count | 进程数量 |
 | `tcp_conn` | string | count | TCP 已建立连接数 |
 | `udp_conn` | string | count | UDP 连接或端点数量 |
-| `ip_v4` | string | IP/`0` | Cloudflare trace 获取到的 IPv4 |
-| `ip_v6` | string | IP/`0` | Cloudflare trace 获取到的 IPv6 |
+| `ip_v4` | string | IP/`0` | 公网 IPv4；优先用 `WORKER_URL` 的 `/cdn-cgi/trace` 获取，失败后回退内置公共源 |
+| `ip_v6` | string | IP/`0` | 公网 IPv6；优先用 `WORKER_URL` 的 `/cdn-cgi/trace` 获取，失败后回退内置公共源 |
 | `ping_ct` / `ping_cu` / `ping_cm` / `ping_bgp` | string/boolean | ms/`false`/`"null"` | 电信、联通、移动、BGP 节点探测 RTT；节点未配置为 `false`，探测失败为字符串 `"null"` |
 | `loss_ct` / `loss_cu` / `loss_cm` / `loss_bd` | string/boolean | `%`/`false` | 对应探测丢包率；节点未配置为 `false` |
 
@@ -489,7 +489,7 @@ WSS 握手会携带标准 WebSocket Upgrade 头，并附带以下 Agent 头：
 
 除安装脚本外，也可以把 Agent 以容器方式运行。镜像以 `cf-probe run` 前台模式启动，后台常驻、开机自启和崩溃重启都交给 Docker 的重启策略；容器内不使用 systemd/launchd，也不会触碰裸机安装路径。
 
-镜像发布在 `ghcr.io/<owner>/cfsm-agent`，提供 `latest`、版本号和 commit sha 标签（多架构 `linux/amd64`、`linux/arm64`）。
+镜像发布在 `ghcr.io/<owner>/cfsm-agent`，提供 `latest`、版本号和 commit sha 标签（多架构 `linux/amd64`、`linux/arm64`）。预发布通道为 `:snapshot`，始终指向最新一次 `main` 构建；同一镜像另带与 GitHub 预发布同名的 `Snapshot-<YYMMDDHHMM>` 时间戳标签，便于固定版本，旧的时间戳镜像只保留最新一份。
 
 推荐以 host 网络模式运行，这样网卡流量、月流量和 TCP/UDP 连接数才是宿主机的真实数据：
 
@@ -526,11 +526,13 @@ docker run -d --name cf-probe \
 
 **升级方式**：`docker pull` 新镜像后重建容器。容器内 `AUTO_UPDATE` 恒为 `0`，禁用二进制自更新——因为自替换的二进制只存在于容器可写层，重建容器或更新镜像时会被镜像内的版本重新覆盖，导致版本回退。请通过更新镜像而非容器内自更新来升级。
 
+**与宿主安装共存**：同一台机器可以同时运行容器实例和宿主安装（root 或普通用户）。安装时会识别并跳过容器内的 `cf-probe` 实例，既不报错也不停止容器；宿主侧原有的 root 与普通用户互斥规则保持不变。多个容器之间同样互不影响。共存时必须保证每个实例使用不同的 `SERVER_ID` 和独立的数据卷，否则服务端会收到互相覆盖的数据；容器未加 `--network=host` 时流量口径也与宿主机不同。
+
 **容器视角的监控边界**：
 
 - 开箱即准确：CPU、内存/Swap、负载、启动时间、操作系统/内核/CPU 信息、公网 IPv4/IPv6、Ping 探测（需容器可出网）。
 - 依赖 `--network=host`：网卡累计流量与网速、月流量、TCP/UDP 连接数。不加时只能看到容器自身 `eth0` 的少量流量，且容器重启后计数归零、`-interface` 指定宿主网卡会匹配为空。
-- 磁盘容量：容器内先按 `statfs` 的 `f_fsid` 去重 bind mount，再把 overlay 根（overlayfs 会透传底层块数但自造 `f_fsid`）按「总容量 + 已用」合并到同盘的真实块设备，因此不会把同一块盘算两次；对**单盘宿主**，容器总/已用容量与宿主机一致。但**未挂载进容器的其它独立数据盘**仍无法看到（受 mount namespace 限制）。
+- 磁盘容量：容器内先按 `statfs` 的 `f_fsid` 去重 bind mount，再把 overlay 根（overlayfs 会透传底层块数但自造 `f_fsid`）按「总容量 + 已用」合并到同盘的真实块设备，因此不会把同一块盘算两次；对**单盘宿主**，容器总/已用容量与宿主机一致。ZFS 例外：每个 dataset 的 `f_fsid` 各不相同，改按 pool 名去重，避免 Incus/LXD、TrueNAS、Proxmox 等宿主把几十个容器数据集累加成数倍容量。但**未挂载进容器的其它独立数据盘**仍无法看到（受 mount namespace 限制）。
 - 本期容器方式不覆盖（值会缺失或不准）：磁盘 IO、进程数（受 pid/mount namespace 限制）、GPU（需驱动与设备透传进镜像）。这些指标在裸机安装方式下不受影响。
 
 ### 本地构建镜像
