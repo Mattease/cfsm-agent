@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var ifacePartRE = regexp.MustCompile(`^[A-Za-z0-9_.:\-\*\?\[\]]+$`)
@@ -20,6 +21,8 @@ func defaultConfig() Config {
 		CollectInterval: 0,
 		ReportInterval:  defaultReportIntervalSec,
 		ResetDay:        1,
+		ResetTime:       "00:00:00",
+		Timezone:        "",
 		ConnectionMode:  connectionModeAuto,
 		PingMode:        pingModeTCP,
 		UA:              defaultUserAgent,
@@ -165,6 +168,8 @@ func readConfig(path string) (Config, error) {
 	cfg.Node4 = values["NODE_4"]
 	cfg.Interface, _ = normalizeInterfaceList(values["INTERFACE"])
 	cfg.ResetDay = parseIntDefault(values["RESET_DAY"], cfg.ResetDay)
+	cfg.ResetTime = normalizeResetTime(values["RESET_TIME"])
+	cfg.Timezone = normalizeTimezone(values["TIMEZONE"])
 	cfg.ConnectionMode, _ = normalizeConnectionMode(values["CONNECTION_MODE"])
 	cfg.PingMode, _ = normalizePingMode(values["PING_MODE"])
 	cfg.UA = normalizeUserAgentValue(values["UA"])
@@ -203,6 +208,8 @@ func writeConfig(path string, cfg Config) error {
 	writeKV("NODE_4", cfg.Node4)
 	writeKV("INTERFACE", cfg.Interface)
 	writeKV("RESET_DAY", strconv.Itoa(cfg.ResetDay))
+	writeKV("RESET_TIME", cfg.ResetTime)
+	writeKV("TIMEZONE", cfg.Timezone)
 	writeKV("CONNECTION_MODE", cfg.ConnectionMode)
 	writeKV("PING_MODE", cfg.PingMode)
 	writeKV("UA", cfg.UA)
@@ -237,6 +244,8 @@ func normalizeConfigIntervals(cfg *Config) {
 	if cfg.ResetDay < 0 || cfg.ResetDay > 31 {
 		cfg.ResetDay = 1
 	}
+	cfg.ResetTime = normalizeResetTime(cfg.ResetTime)
+	cfg.Timezone = normalizeTimezone(cfg.Timezone)
 	if cfg.ConfigMD5 == "" {
 		cfg.ConfigMD5 = "none"
 	}
@@ -252,6 +261,55 @@ func normalizeConfigIntervals(cfg *Config) {
 	}
 	cfg.UA = normalizeUserAgentValue(cfg.UA)
 	cfg.UpdateProxy = strings.TrimSpace(cfg.UpdateProxy)
+}
+
+// normalizeResetTime 校验 "HH:MM:SS"（时 0-23，分秒 0-59），非法回落
+// "00:00:00"；合法值按规范零填充返回。
+func normalizeResetTime(s string) string {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 3 {
+		return "00:00:00"
+	}
+	nums := make([]int, 3)
+	for i, part := range parts {
+		if part == "" || len(part) > 2 {
+			return "00:00:00"
+		}
+		for j := 0; j < len(part); j++ {
+			if part[j] < '0' || part[j] > '9' {
+				return "00:00:00"
+			}
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return "00:00:00"
+		}
+		nums[i] = n
+	}
+	if nums[0] > 23 || nums[1] > 59 || nums[2] > 59 {
+		return "00:00:00"
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", nums[0], nums[1], nums[2])
+}
+
+// timezoneNameRE 是时区名的白名单：与服务端约定一致，只允许 IANA 名里的
+// 字母、数字、下划线、加号、减号和斜杠，长度 1-64。
+var timezoneNameRE = regexp.MustCompile(`^[A-Za-z0-9_+\-/]{1,64}$`)
+
+// normalizeTimezone 校验 IANA 时区名：trim 后过白名单正则并用
+// time.LoadLocation 验证，失败回落 ""（机器本地时区），不报错。
+func normalizeTimezone(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if !timezoneNameRE.MatchString(s) {
+		return ""
+	}
+	if _, err := time.LoadLocation(s); err != nil {
+		return ""
+	}
+	return s
 }
 
 func parseIntDefault(raw string, def int) int {

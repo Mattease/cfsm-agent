@@ -148,6 +148,10 @@ func mergeExplicitInstallConfig(dst *Config, src Config, explicit map[string]boo
 			dst.Interface = src.Interface
 		case "reset_day":
 			dst.ResetDay = src.ResetDay
+		case "reset_time":
+			dst.ResetTime = src.ResetTime
+		case "timezone":
+			dst.Timezone = src.Timezone
 		case "connection_mode":
 			dst.ConnectionMode = src.ConnectionMode
 		case "ping_mode":

@@ -64,9 +64,9 @@ type Agent struct {
 	updateMu         sync.Mutex
 	// configWriteMu 串行化配置文件写入：动态配置下发与 UA 下发是两条独立通道，
 	// 并发写会把对方的字段覆盖回旧值。
-	configWriteMu    sync.Mutex
-	reporter         *reportTransport
-	reportMu         sync.Mutex
+	configWriteMu sync.Mutex
+	reporter      *reportTransport
+	reportMu      sync.Mutex
 	// reportFailures 是 WSS 与 POST 共用的连续失败计数：握手 401/403、WSS error 帧、
 	// POST 4xx/5xx、WS close 1008 都计入，任意一次成功（POST 2xx、非实时提示 ack、
 	// 或 WSS 握手通过）清零。
@@ -247,8 +247,8 @@ func Run(configFile string, debug bool, version string) error {
 	a.basicAt = time.Now()
 
 	a.log.info("CF-Server-Monitor Go Probe started version=%s platform=%s config=%s", version, platformName(), paths.ConfigFile)
-	a.log.debugf("config id=%s url=%s report_interval=%ds collect_interval=%ds reset_day=%d connection_mode=%s ping_mode=%s interface=%s auto_update=%v",
-		cfg.ServerID, cfg.WorkerURL, cfg.ReportInterval, cfg.CollectInterval, cfg.ResetDay, cfg.ConnectionMode, cfg.PingMode, firstNonEmpty(cfg.Interface, "auto"), cfg.AutoUpdate)
+	a.log.debugf("config id=%s url=%s report_interval=%ds collect_interval=%ds reset_day=%d reset_time=%s timezone=%s connection_mode=%s ping_mode=%s interface=%s auto_update=%v",
+		cfg.ServerID, cfg.WorkerURL, cfg.ReportInterval, cfg.CollectInterval, cfg.ResetDay, cfg.ResetTime, firstNonEmpty(cfg.Timezone, "local"), cfg.ConnectionMode, cfg.PingMode, firstNonEmpty(cfg.Interface, "auto"), cfg.AutoUpdate)
 
 	go a.networkWorker(ctx)
 	if a.usesWSS() {
@@ -685,14 +685,14 @@ func (a *Agent) tick() {
 		// Failed reads must not replace the persisted counter baseline with zero.
 		if netErr == nil {
 			var err error
-			a.monthlyRX, a.monthlyTX, err = calcMonthlyTraffic(a.paths.TrafficFile, netNow, cfg.ResetDay, cfg.Interface)
+			a.monthlyRX, a.monthlyTX, err = calcMonthlyTraffic(a.paths.TrafficFile, netNow, cfg.ResetDay, cfg.ResetTime, resolveResetLocation(cfg.Timezone), cfg.Interface)
 			if err != nil {
 				a.log.warnfOnce("traffic-state", "monthly traffic checkpoint failed: %v", err)
 			}
 		} else if a.fullAt.IsZero() {
 			// Startup and configuration refresh must retain valid saved totals
 			// even if the first network read fails. Keep live cached totals later.
-			a.monthlyRX, a.monthlyTX = readMonthlyTrafficTotals(a.paths.TrafficFile, cfg.ResetDay, cfg.Interface, now)
+			a.monthlyRX, a.monthlyTX = readMonthlyTrafficTotals(a.paths.TrafficFile, cfg.ResetDay, cfg.ResetTime, resolveResetLocation(cfg.Timezone), cfg.Interface, now)
 		}
 		a.diskIO = a.sampleDiskIO(now)
 		a.fullAt = now
@@ -1281,6 +1281,8 @@ func (a *Agent) applyRemoteConfigWithOptions(body []byte, headers http.Header, a
 		"report_interval":     true,
 		"wss_report_interval": true,
 		"reset_day":           true,
+		"reset_time":          true,
+		"timezone":            true,
 		"schema_version":      true,
 		"custom_ct":           true,
 		"custom_cu":           true,
@@ -1306,7 +1308,7 @@ func (a *Agent) applyRemoteConfigWithOptions(body []byte, headers http.Header, a
 	if update != "" && update != "0" && update != "1" {
 		return fmt.Errorf("invalid update %s", update)
 	}
-	hasConfig := values.Has("collect_interval") || values.Has("report_interval") || values.Has("wss_report_interval") || values.Has("reset_day") || values.Has("schema_version") || values.Has("interface") || values.Has("connection_mode") || values.Has("ping_mode") || values.Has("node_1") || values.Has("node_2") || values.Has("node_3") || values.Has("node_4")
+	hasConfig := values.Has("collect_interval") || values.Has("report_interval") || values.Has("wss_report_interval") || values.Has("reset_day") || values.Has("reset_time") || values.Has("timezone") || values.Has("schema_version") || values.Has("interface") || values.Has("connection_mode") || values.Has("ping_mode") || values.Has("node_1") || values.Has("node_2") || values.Has("node_3") || values.Has("node_4")
 	hasCorrection := values.Has("rx_correction") || values.Has("tx_correction")
 	cfg := a.configSnapshot()
 	if !hasConfig {
@@ -1348,8 +1350,11 @@ func (a *Agent) applyRemoteConfigWithOptions(body []byte, headers http.Header, a
 	if reset < 0 || reset > 31 {
 		return fmt.Errorf("invalid reset_day %d", reset)
 	}
-	if values.Get("schema_version") != configSchemaVersion {
-		return fmt.Errorf("invalid schema_version %s", values.Get("schema_version"))
+	// 同时接受 schema 7（老面板：不下发 reset_time/timezone）和 8。
+	// schema 7 时这两个字段保持当前值，绝不能重置为默认值。
+	schemaVersion := values.Get("schema_version")
+	if schemaVersion != "7" && schemaVersion != configSchemaVersion {
+		return fmt.Errorf("invalid schema_version %s", schemaVersion)
 	}
 	if report < collect {
 		return errors.New("report_interval less than collect_interval")
@@ -1370,17 +1375,33 @@ func (a *Agent) applyRemoteConfigWithOptions(body []byte, headers http.Header, a
 	if connectionMode == connectionModeAuto && (collect == 0 || collect > wssReport) {
 		effectiveCollect = wssReport
 	}
+	// schema 7 的老面板不下发 reset_time/timezone：保持当前值。
+	// schema 8 按 payload 解析，非法值回落默认值并记 warn，不拒绝整个配置。
+	resetTime := cfg.ResetTime
+	timezone := cfg.Timezone
+	if schemaVersion != "7" {
+		resetTime = normalizeResetTime(values.Get("reset_time"))
+		if values.Has("reset_time") && resetTime != values.Get("reset_time") {
+			a.log.warnf("invalid reset_time %q, fallback to 00:00:00", values.Get("reset_time"))
+		}
+		timezone = normalizeTimezone(values.Get("timezone"))
+		if values.Has("timezone") && timezone != values.Get("timezone") {
+			a.log.warnf("invalid timezone %q, fallback to local timezone", values.Get("timezone"))
+		}
+	}
 	shouldApply := false
 	if hasRemoteMD5 {
 		shouldApply = newMD5 != cfg.ConfigMD5
 	} else {
-		shouldApply = remoteConfigDiffers(cfg, values, effectiveCollect, report, reset, iface, connectionMode, pingMode)
+		shouldApply = remoteConfigDiffers(cfg, values, effectiveCollect, report, reset, resetTime, timezone, iface, connectionMode, pingMode)
 	}
 	if shouldApply {
 		nextCfg := cfg
 		nextCfg.CollectInterval = effectiveCollect
 		nextCfg.ReportInterval = report
 		nextCfg.ResetDay = reset
+		nextCfg.ResetTime = resetTime
+		nextCfg.Timezone = timezone
 		nextCfg.CTNode = values.Get("custom_ct")
 		nextCfg.CUNode = values.Get("custom_cu")
 		nextCfg.CMNode = values.Get("custom_cm")
@@ -1460,10 +1481,12 @@ func (a *Agent) syncReportTransport() {
 	}
 }
 
-func remoteConfigDiffers(cfg Config, values url.Values, collect, report, reset int, iface, connectionMode, pingMode string) bool {
+func remoteConfigDiffers(cfg Config, values url.Values, collect, report, reset int, resetTime, timezone, iface, connectionMode, pingMode string) bool {
 	return cfg.CollectInterval != collect ||
 		cfg.ReportInterval != report ||
 		cfg.ResetDay != reset ||
+		cfg.ResetTime != resetTime ||
+		cfg.Timezone != timezone ||
 		cfg.CTNode != values.Get("custom_ct") ||
 		cfg.CUNode != values.Get("custom_cu") ||
 		cfg.CMNode != values.Get("custom_cm") ||

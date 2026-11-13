@@ -135,3 +135,33 @@ func TestParseInstallOptionsTracksExplicitFlags(t *testing.T) {
 		t.Fatalf("unexpected explicit flags: %v", got.Explicit)
 	}
 }
+
+func TestParseInstallOptionsResetTimeTimezone(t *testing.T) {
+	got, err := parseInstallOptions(nil)
+	if err != nil {
+		t.Fatalf("parseInstallOptions(nil) error = %v", err)
+	}
+	if got.ResetTime != "00:00:00" || got.Timezone != "" {
+		t.Fatalf("defaults ResetTime/Timezone = %q/%q, want 00:00:00/empty", got.ResetTime, got.Timezone)
+	}
+
+	got, err = parseInstallOptions([]string{"-reset_time=15:30:00", "-timezone=America/Los_Angeles"})
+	if err != nil {
+		t.Fatalf("parseInstallOptions(-reset_time/-timezone) error = %v", err)
+	}
+	if got.ResetTime != "15:30:00" || got.Timezone != "America/Los_Angeles" {
+		t.Fatalf("ResetTime/Timezone = %q/%q, want 15:30:00/America/Los_Angeles", got.ResetTime, got.Timezone)
+	}
+	if !got.Explicit["reset_time"] || !got.Explicit["timezone"] {
+		t.Fatalf("Explicit = %v, want reset_time and timezone tracked", got.Explicit)
+	}
+
+	// 非法值回落默认值，不报错退出。
+	got, err = parseInstallOptions([]string{"-reset_time=25:00:00", "-timezone=Bad!!Zone"})
+	if err != nil {
+		t.Fatalf("parseInstallOptions(invalid reset_time/timezone) error = %v", err)
+	}
+	if got.ResetTime != "00:00:00" || got.Timezone != "" {
+		t.Fatalf("invalid ResetTime/Timezone = %q/%q, want 00:00:00/empty", got.ResetTime, got.Timezone)
+	}
+}

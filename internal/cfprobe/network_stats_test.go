@@ -82,7 +82,7 @@ func TestNetworkReadFailureDoesNotInflateTrafficOnRecovery(t *testing.T) {
 	if rx != 5 || tx != 10 {
 		t.Fatalf("recovery rates=%d/%d, want 5/10", rx, tx)
 	}
-	monthlyRX, monthlyTX, err := calcMonthlyTraffic(path, current, 0, "")
+	monthlyRX, monthlyTX, err := calcMonthlyTraffic(path, current, 0, "00:00:00", nil, "")
 	if err != nil || monthlyRX != 510 || monthlyTX != 620 {
 		t.Fatalf("recovery totals=%d/%d error=%v", monthlyRX, monthlyTX, err)
 	}

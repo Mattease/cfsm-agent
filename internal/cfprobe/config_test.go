@@ -1,7 +1,9 @@
 package cfprobe
 
 import (
+	"net/http"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -199,5 +201,254 @@ func TestApplyRemoteUserAgentUpdatesConfigOnce(t *testing.T) {
 	agent.applyRemoteUserAgent("bad\"ua")
 	if got := agent.configSnapshot().UA; got != "MyAgent/1.0" {
 		t.Fatalf("UA after invalid input = %q", got)
+	}
+}
+
+func TestNormalizeResetTime(t *testing.T) {
+	valid := map[string]string{
+		"00:00:00":   "00:00:00",
+		"23:59:59":   "23:59:59",
+		"15:30:00":   "15:30:00",
+		"1:2:3":      "01:02:03",
+		" 06:00:00 ": "06:00:00",
+	}
+	for in, want := range valid {
+		if got := normalizeResetTime(in); got != want {
+			t.Fatalf("normalizeResetTime(%q) = %q, want %q", in, got, want)
+		}
+	}
+	invalid := []string{
+		"",
+		"24:00:00",
+		"12:60:00",
+		"12:00:60",
+		"-1:00:00",
+		"12:00",
+		"12:00:00:00",
+		"ab:cd:ef",
+		"12:00:0x",
+		"123:00:00",
+	}
+	for _, in := range invalid {
+		if got := normalizeResetTime(in); got != "00:00:00" {
+			t.Fatalf("normalizeResetTime(%q) = %q, want 00:00:00", in, got)
+		}
+	}
+}
+
+func TestNormalizeTimezone(t *testing.T) {
+	valid := []string{
+		"",
+		"UTC",
+		"America/Los_Angeles",
+		"Asia/Shanghai",
+		"Etc/GMT+5",
+	}
+	for _, in := range valid {
+		if got := normalizeTimezone(in); got != in {
+			t.Fatalf("normalizeTimezone(%q) = %q, want %q", in, got, in)
+		}
+	}
+	if got := normalizeTimezone("  America/Los_Angeles  "); got != "America/Los_Angeles" {
+		t.Fatalf("normalizeTimezone with spaces = %q", got)
+	}
+	invalid := []string{
+		"Bad!!Zone",
+		"No/Such_Zone",
+		"America/Los Angeles",
+		"../etc/passwd",
+		strings.Repeat("a", 65),
+	}
+	for _, in := range invalid {
+		if got := normalizeTimezone(in); got != "" {
+			t.Fatalf("normalizeTimezone(%q) = %q, want empty", in, got)
+		}
+	}
+}
+
+func TestConfigPersistsResetTimeAndTimezone(t *testing.T) {
+	path := t.TempDir() + "/config.conf"
+	cfg := defaultConfig()
+	cfg.ServerID = "sid"
+	cfg.Secret = "secret"
+	cfg.WorkerURL = "https://worker.example.com/report"
+	cfg.ResetDay = 8
+	cfg.ResetTime = "15:30:00"
+	cfg.Timezone = "America/Los_Angeles"
+
+	if err := writeConfig(path, cfg); err != nil {
+		t.Fatalf("writeConfig returned error: %v", err)
+	}
+	got, err := readConfig(path)
+	if err != nil {
+		t.Fatalf("readConfig returned error: %v", err)
+	}
+	if got.ResetTime != "15:30:00" || got.Timezone != "America/Los_Angeles" || got.ResetDay != 8 {
+		t.Fatalf("round-trip reset config = %d/%q/%q, want 8/15:30:00/America/Los_Angeles", got.ResetDay, got.ResetTime, got.Timezone)
+	}
+
+	// 配置文件里的非法值回落默认值，不报错退出。
+	raw := "SERVER_ID=\"sid\"\nSECRET=\"secret\"\nWORKER_URL=\"https://worker.example.com/report\"\nRESET_TIME=\"99:99:99\"\nTIMEZONE=\"Bad!!Zone\"\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config fixture: %v", err)
+	}
+	got, err = readConfig(path)
+	if err != nil {
+		t.Fatalf("readConfig returned error: %v", err)
+	}
+	if got.ResetTime != "00:00:00" || got.Timezone != "" {
+		t.Fatalf("invalid values fell back to %q/%q, want 00:00:00/empty", got.ResetTime, got.Timezone)
+	}
+
+	// 老配置文件没有这两个键时取默认值。
+	raw = "SERVER_ID=\"sid\"\nSECRET=\"secret\"\nWORKER_URL=\"https://worker.example.com/report\"\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config fixture: %v", err)
+	}
+	got, err = readConfig(path)
+	if err != nil {
+		t.Fatalf("readConfig returned error: %v", err)
+	}
+	if got.ResetTime != "00:00:00" || got.Timezone != "" {
+		t.Fatalf("missing keys defaulted to %q/%q, want 00:00:00/empty", got.ResetTime, got.Timezone)
+	}
+}
+
+// schema 7（老面板）：不下发 reset_time/timezone，必须保持当前值。
+func TestRemoteConfigSchema7KeepsResetTimeTimezone(t *testing.T) {
+	tmp := t.TempDir()
+	configFile := tmp + "/config.conf"
+	a := Agent{
+		cfg: Config{
+			ServerID:       "sid",
+			Secret:         "secret",
+			WorkerURL:      "https://worker.example.com/report",
+			ReportInterval: 60,
+			ResetDay:       1,
+			ResetTime:      "15:30:00",
+			Timezone:       "America/Los_Angeles",
+			ConnectionMode: connectionModeAuto,
+			PingMode:       pingModeTCP,
+			UA:             defaultUserAgent,
+			ConfigMD5:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		paths: Paths{ConfigFile: configFile, TrafficFile: tmp + "/traffic.dat"},
+		log:   newLogger(false),
+	}
+	if err := writeConfig(configFile, a.cfg); err != nil {
+		t.Fatalf("writeConfig returned error: %v", err)
+	}
+	headers := http.Header{"X-Agent-Config-Md5": []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
+	body := []byte("collect_interval=0&report_interval=60&reset_day=1&schema_version=7&interface=&node_1=&node_2=&node_3=&node_4=&connection_mode=auto&ping_mode=tcp")
+	if err := a.applyRemoteConfig(body, headers); err != nil {
+		t.Fatalf("applyRemoteConfig() error = %v", err)
+	}
+	got := a.configSnapshot()
+	if got.ResetTime != "15:30:00" || got.Timezone != "America/Los_Angeles" {
+		t.Fatalf("schema 7 reset config = %q/%q, want 15:30:00/America/Los_Angeles", got.ResetTime, got.Timezone)
+	}
+	persisted, err := readConfig(configFile)
+	if err != nil {
+		t.Fatalf("readConfig() error = %v", err)
+	}
+	if persisted.ResetTime != "15:30:00" || persisted.Timezone != "America/Los_Angeles" {
+		t.Fatalf("persisted reset config = %q/%q, want 15:30:00/America/Los_Angeles", persisted.ResetTime, persisted.Timezone)
+	}
+}
+
+// schema 8：按 payload 解析 reset_time/timezone；timezone 的 / 由面板
+// percent-encode（%2F）后传输，ParseQuery 自动解码。
+func TestRemoteConfigSchema8AppliesResetTimeTimezone(t *testing.T) {
+	tmp := t.TempDir()
+	configFile := tmp + "/config.conf"
+	a := Agent{
+		cfg: Config{
+			ServerID:       "sid",
+			Secret:         "secret",
+			WorkerURL:      "https://worker.example.com/report",
+			ReportInterval: 60,
+			ResetDay:       1,
+			ResetTime:      "00:00:00",
+			Timezone:       "",
+			ConnectionMode: connectionModeAuto,
+			PingMode:       pingModeTCP,
+			UA:             defaultUserAgent,
+			ConfigMD5:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		paths: Paths{ConfigFile: configFile, TrafficFile: tmp + "/traffic.dat"},
+		log:   newLogger(false),
+	}
+	if err := writeConfig(configFile, a.cfg); err != nil {
+		t.Fatalf("writeConfig returned error: %v", err)
+	}
+	headers := http.Header{"X-Agent-Config-Md5": []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
+	body := []byte("collect_interval=0&report_interval=60&reset_day=8&reset_time=15:30:00&timezone=America%2FLos_Angeles&schema_version=8&interface=&node_1=&node_2=&node_3=&node_4=&connection_mode=auto&ping_mode=tcp")
+	if err := a.applyRemoteConfig(body, headers); err != nil {
+		t.Fatalf("applyRemoteConfig() error = %v", err)
+	}
+	got := a.configSnapshot()
+	if got.ResetDay != 8 || got.ResetTime != "15:30:00" || got.Timezone != "America/Los_Angeles" {
+		t.Fatalf("schema 8 reset config = %d/%q/%q, want 8/15:30:00/America/Los_Angeles", got.ResetDay, got.ResetTime, got.Timezone)
+	}
+	persisted, err := readConfig(configFile)
+	if err != nil {
+		t.Fatalf("readConfig() error = %v", err)
+	}
+	if persisted.ResetTime != "15:30:00" || persisted.Timezone != "America/Los_Angeles" {
+		t.Fatalf("persisted reset config = %q/%q, want 15:30:00/America/Los_Angeles", persisted.ResetTime, persisted.Timezone)
+	}
+
+	// 非法值回落默认值，不拒绝整个配置。
+	headers = http.Header{"X-Agent-Config-Md5": []string{"cccccccccccccccccccccccccccccccc"}}
+	body = []byte("collect_interval=0&report_interval=60&reset_day=1&reset_time=25:00:00&timezone=No%2FSuch_Zone&schema_version=8&interface=&node_1=&node_2=&node_3=&node_4=&connection_mode=auto&ping_mode=tcp")
+	if err := a.applyRemoteConfig(body, headers); err != nil {
+		t.Fatalf("applyRemoteConfig(invalid values) error = %v", err)
+	}
+	got = a.configSnapshot()
+	if got.ResetTime != "00:00:00" || got.Timezone != "" {
+		t.Fatalf("invalid values fell back to %q/%q, want 00:00:00/empty", got.ResetTime, got.Timezone)
+	}
+
+	// schema 9 仍拒绝。
+	headers = http.Header{"X-Agent-Config-Md5": []string{"dddddddddddddddddddddddddddddddd"}}
+	body = []byte("collect_interval=0&report_interval=60&reset_day=1&schema_version=9&interface=&node_1=&node_2=&node_3=&node_4=&connection_mode=auto&ping_mode=tcp")
+	if err := a.applyRemoteConfig(body, headers); err == nil {
+		t.Fatal("schema_version=9 was accepted")
+	}
+}
+
+// 无 MD5 时（WSS 通道）靠 remoteConfigDiffers 判定：只改 reset_time/timezone
+// 也必须触发应用。
+func TestRemoteConfigDiffersOnResetTimeTimezone(t *testing.T) {
+	tmp := t.TempDir()
+	configFile := tmp + "/config.conf"
+	a := Agent{
+		cfg: Config{
+			ServerID:        "sid",
+			Secret:          "secret",
+			WorkerURL:       "https://worker.example.com/report",
+			CollectInterval: defaultWSSReportIntervalSec,
+			ReportInterval:  60,
+			ResetDay:        1,
+			ResetTime:       "00:00:00",
+			Timezone:        "",
+			ConnectionMode:  connectionModeAuto,
+			PingMode:        pingModeTCP,
+			UA:              defaultUserAgent,
+			ConfigMD5:       "none",
+		},
+		paths: Paths{ConfigFile: configFile, TrafficFile: tmp + "/traffic.dat"},
+		log:   newLogger(false),
+	}
+	if err := writeConfig(configFile, a.cfg); err != nil {
+		t.Fatalf("writeConfig returned error: %v", err)
+	}
+	body := []byte("collect_interval=0&report_interval=60&reset_day=1&reset_time=15:30:00&timezone=America%2FLos_Angeles&schema_version=8&interface=&node_1=&node_2=&node_3=&node_4=&connection_mode=auto&ping_mode=tcp")
+	if err := a.applyWSSRemoteConfig(body, http.Header{}); err != nil {
+		t.Fatalf("applyWSSRemoteConfig() error = %v", err)
+	}
+	got := a.configSnapshot()
+	if got.ResetTime != "15:30:00" || got.Timezone != "America/Los_Angeles" {
+		t.Fatalf("reset config = %q/%q, want 15:30:00/America/Los_Angeles", got.ResetTime, got.Timezone)
 	}
 }
