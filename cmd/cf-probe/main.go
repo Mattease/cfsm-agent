@@ -8,7 +8,7 @@ import (
 	"github.com/huilang-me/cfsm-agent/internal/cfprobe"
 )
 
-var version = "dev"
+var version = "EV1.1.4"
 
 func main() {
 	if err := cfprobe.Execute(os.Args[1:], version); err != nil {
